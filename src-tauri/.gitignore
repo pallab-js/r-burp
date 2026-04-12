@@ -1,0 +1,9 @@
+# Build output
+target/
+
+# Generated files
+gen/
+
+# Certificate files (generated at runtime)
+*.pem
+*.pem.enc

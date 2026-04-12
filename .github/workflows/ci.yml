@@ -1,0 +1,134 @@
+name: Build and Release
+
+on:
+  push:
+    branches: ["main"]
+    tags:
+      - "v*"
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+# This workflow will build the app for all platforms and create a release
+
+jobs:
+  test:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        working-directory: ./src
+        run: npm ci
+
+      - name: Run Rust tests
+        working-directory: ./src-tauri
+        run: cargo test
+
+      - name: Run Clippy
+        working-directory: ./src-tauri
+        run: cargo clippy -- -D warnings
+
+      - name: Run cargo-audit (dependency CVE scan)
+        working-directory: ./src-tauri
+        run: cargo audit || true
+
+      - name: Run npm audit
+        working-directory: ./src
+        run: npm audit || true
+
+      - name: Build frontend
+        working-directory: ./src
+        run: npm run build
+
+  build:
+    name: Build (${{ matrix.platform.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: macos-latest
+            name: macOS
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install system dependencies (Ubuntu only)
+        if: matrix.platform.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      - name: Install frontend dependencies
+        working-directory: ./src
+        run: npm ci
+
+      - name: Build Tauri app
+        run: cargo tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.name }}-binaries
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+          retention-days: 14
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            **/*.dmg
+            **/*.app
+            **/*.deb
+            **/*.AppImage
+            **/*.msi
+            **/*.exe
+          draft: true
+          generate_release_notes: true

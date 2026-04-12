@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme inline {
+  /* === Primary Colors === */
+  --color-cursor-dark: #26251e;
+  --color-cream: #f2f1ed;
+  --color-cursor-light: #e6e5e0;
+  --color-pure-white: #ffffff;
+  --color-true-black: #000000;
+
+  /* === Accent Colors === */
+  --color-accent: #f54e00;
+  --color-gold: #c08532;
+
+  /* === Semantic Colors === */
+  --color-error: #cf2d56;
+  --color-success: #1f8a65;
+
+  /* === Timeline / Feature Colors === */
+  --color-thinking: #dfa88f;
+  --color-grep: #9fc9a2;
+  --color-read: #9fbbe0;
+  --color-edit: #c0a8dd;
+
+  /* === Surface Scale === */
+  --color-surface-100: #f7f7f4;
+  --color-surface-200: #f2f1ed;
+  --color-surface-300: #ebeae5;
+  --color-surface-400: #e6e5e0;
+  --color-surface-500: #e1e0db;
+
+  /* === Border Colors === */
+  --color-border-primary: oklab(0.263084 -0.00230259 0.0124794 / 0.1);
+  --color-border-medium: oklab(0.263084 -0.00230259 0.0124794 / 0.2);
+  --color-border-strong: rgba(38, 37, 30, 0.55);
+  --color-border-solid: #26251e;
+  --color-border-light: #f2f1ed;
+
+  /* === Shadows === */
+  --shadow-card: rgba(0,0,0,0.14) 0px 28px 70px, rgba(0,0,0,0.1) 0px 14px 32px, oklab(0.263084 -0.00230259 0.0124794 / 0.1) 0px 0px 0px 1px;
+  --shadow-ambient: rgba(0,0,0,0.02) 0px 0px 16px, rgba(0,0,0,0.008) 0px 0px 8px;
+  --shadow-focus: rgba(0,0,0,0.1) 0px 4px 12px;
+
+  /* === Typography === */
+  --font-gothic: "CursorGothic", "CursorGothic Fallback", system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-serif: "jjannon", "Iowan Old Style", "Palatino Linotype", "URW Palladio L", P052, ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-mono: "berkeleyMono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-system: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+
+  /* === Border Radius === */
+  --radius-micro: 1.5px;
+  --radius-small: 2px;
+  --radius-medium: 3px;
+  --radius-standard: 4px;
+  --radius-comfortable: 8px;
+  --radius-featured: 10px;
+  --radius-pill: 9999px;
+
+  /* === Transitions === */
+  --transition-color: 150ms ease;
+  --transition-shadow: 200ms ease;
+}
+
+body {
+  background: var(--color-cream);
+  color: var(--color-cursor-dark);
+  font-family: var(--font-system);
+}
