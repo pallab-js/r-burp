@@ -47,7 +47,9 @@ jobs:
 
       - name: Run cargo-audit (dependency CVE scan)
         working-directory: ./src-tauri
-        run: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
       - name: Run npm audit
         working-directory: ./src
