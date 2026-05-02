@@ -21,15 +21,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            listeners: Mutex::new(vec![
-                ListenerConfig {
-                    id: 1,
-                    host: "127.0.0.1".to_string(),
-                    port: 8080,
-                    is_running: false,
-                    intercept_https: true,
-                },
-            ]),
+            listeners: Mutex::new(vec![]),
             request_count: Mutex::new(0),
         }
     }
@@ -156,15 +148,7 @@ mod tests {
 
     fn create_test_state() -> AppState {
         AppState {
-            listeners: Mutex::new(vec![
-                ListenerConfig {
-                    id: 1,
-                    host: "127.0.0.1".to_string(),
-                    port: 8080,
-                    is_running: false,
-                    intercept_https: true,
-                },
-            ]),
+            listeners: Mutex::new(vec![]),
             request_count: Mutex::new(0),
         }
     }
@@ -243,16 +227,14 @@ mod tests {
     fn test_get_listeners_returns_initial_listener() {
         let state = create_test_state();
         let listeners = state.listeners.lock().unwrap();
-        assert_eq!(listeners.len(), 1);
-        assert_eq!(listeners[0].id, 1);
-        assert_eq!(listeners[0].host, "127.0.0.1");
-        assert_eq!(listeners[0].port, 8080);
+        assert_eq!(listeners.len(), 0);
     }
 
     #[test]
     fn test_start_listener_works() {
         let state = create_test_state();
-        let result = test_start_listener(&state, 1);
+        let id = test_add_listener(&state, "127.0.0.1".to_string(), 8080, true).unwrap();
+        let result = test_start_listener(&state, id);
         assert!(result.is_ok());
         assert!(result.unwrap());
 
@@ -263,8 +245,9 @@ mod tests {
     #[test]
     fn test_stop_listener_works() {
         let state = create_test_state();
-        let _ = test_start_listener(&state, 1);
-        let result = test_stop_listener(&state, 1);
+        let id = test_add_listener(&state, "127.0.0.1".to_string(), 8080, true).unwrap();
+        let _ = test_start_listener(&state, id);
+        let result = test_stop_listener(&state, id);
         assert!(result.is_ok());
         assert!(result.unwrap());
 
@@ -309,10 +292,10 @@ mod tests {
         let result = test_add_listener(&state, "192.168.1.1".to_string(), 9090, true);
         assert!(result.is_ok());
         let new_id = result.unwrap();
-        assert!(new_id > 1);
+        assert!(new_id >= 1);
 
         let listeners = state.listeners.lock().unwrap();
-        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners.len(), 1);
 
         let new_listener = listeners.iter().find(|l| l.id == new_id).unwrap();
         assert_eq!(new_listener.host, "192.168.1.1");
@@ -330,7 +313,7 @@ mod tests {
         assert!(result.unwrap());
 
         let listeners = state.listeners.lock().unwrap();
-        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners.len(), 0);
     }
 
     #[test]
@@ -404,7 +387,7 @@ pub fn start_proxy(host: String, port: u16, state: tauri::State<AppRuntime>) -> 
     *state.proxy_shutdown.lock() = Some(shutdown_tx);
 
     state.runtime.spawn(async move {
-        let mut srv = ProxyServer::new(engine_clone, intercept_clone, certs_clone, host_clone, port);
+        let mut srv = ProxyServer::new(engine_clone, intercept_clone, certs_clone, host_clone, port, handle.clone());
         let srv_shutdown = shutdown_rx;
 
         let result = tokio::select! {
@@ -521,7 +504,7 @@ pub fn add_rule(
         _ => return Err(format!("Unknown match type: {}", match_type)),
     };
 
-    Ok(state.intercept.add_rule(name, mtype, match_pattern, actions))
+    state.intercept.add_rule(name, mtype, match_pattern, actions)
 }
 
 #[command]
@@ -547,7 +530,7 @@ use crate::certs::CertInfo;
 
 #[command]
 pub fn generate_ca_cert(state: tauri::State<AppRuntime>) -> Result<String, String> {
-    state.certs.generate_ca()
+    state.certs.generate_ca().map_err(|e| e.to_string())
 }
 
 #[command]
@@ -645,7 +628,11 @@ pub fn export_har(state: tauri::State<AppRuntime>) -> String {
                     content: HarContent {
                         size: resp.map(|r| r.content_length as i64).unwrap_or(0),
                         mime_type: resp.and_then(|r| r.content_type.clone()).unwrap_or_default(),
-                        text: resp.and_then(|r| r.body_text.clone()),
+                        text: resp.and_then(|r| {
+                            r.body.as_deref().and_then(|b| {
+                                crate::proxy::body_as_text(b, r.content_type.as_deref()).map(|s| s.to_string())
+                            })
+                        }),
                     },
                     body_size: resp.map(|r| r.content_length as i64).unwrap_or(0),
                     time: time_ms,

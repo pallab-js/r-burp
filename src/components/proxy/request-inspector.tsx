@@ -80,13 +80,13 @@ export function RequestInspector({ transaction }: RequestInspectorProps) {
           <HeadersView headers={request.headers} />
         )}
         {activeTab === "request" && subTab === "body" && (
-          <BodyView body={request.body_text} contentType={request.content_type} />
+          <BodyView body={decodeBody(request.body, request.content_type)} contentType={request.content_type} />
         )}
         {activeTab === "response" && response && subTab === "headers" && (
           <HeadersView headers={response.headers} />
         )}
         {activeTab === "response" && response && subTab === "body" && (
-          <BodyView body={response.body_text} contentType={response.content_type} />
+          <BodyView body={decodeBody(response.body, response.content_type)} contentType={response.content_type} />
         )}
       </div>
     </div>
@@ -200,6 +200,19 @@ function BodyView({
       </pre>
     </Card>
   );
+}
+
+const TEXT_TYPES = ["text/", "application/json", "application/xml", "application/javascript", "image/svg"];
+
+function decodeBody(body: number[] | null, contentType: string | null): string | null {
+  if (!body || body.length === 0) return null;
+  const isText = contentType && TEXT_TYPES.some((t) => contentType.startsWith(t));
+  if (!isText) return null;
+  try {
+    return new TextDecoder().decode(new Uint8Array(body));
+  } catch {
+    return null;
+  }
 }
 
 function getStatusBadgeColor(status: number): "success" | "grep" | "thinking" | "error" | "default" {

@@ -3,6 +3,7 @@ mod proxy;
 mod server;
 mod intercept;
 mod certs;
+pub mod error;
 
 use commands::AppState;
 use proxy::ProxyEngine;
@@ -32,7 +33,11 @@ impl AppRuntime {
     fn new() -> Self {
         let runtime = Runtime::new().expect("Failed to create tokio runtime");
         let engine = ProxyEngine::new(1000);
-        let certs = CertManager::default();
+
+        // Load or generate the CA key passphrase from the store
+        let passphrase = Self::load_or_generate_passphrase();
+
+        let certs = CertManager::with_passphrase(passphrase);
 
         // Initialize cert manager with app data directory
         let cert_dir = Self::get_cert_dir();
@@ -47,6 +52,56 @@ impl AppRuntime {
             certs: Arc::new(certs),
             app_handle: parking_lot::Mutex::new(None),
             proxy_shutdown: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Load the CA key passphrase from the store file, or generate and persist a new one.
+    fn load_or_generate_passphrase() -> String {
+        let store_path = Self::get_store_path();
+
+        // Try to read existing passphrase from a simple JSON file
+        if store_path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&store_path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(p) = val.get("ca_key_passphrase").and_then(|v| v.as_str()) {
+                        if !p.is_empty() {
+                            return p.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generate a new random 32-byte passphrase
+        let bytes: [u8; 32] = rand::random();
+        let passphrase = hex::encode(bytes);
+
+        // Persist it
+        let val = serde_json::json!({ "ca_key_passphrase": passphrase });
+        if let Some(parent) = store_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&store_path, serde_json::to_string(&val).unwrap_or_default());
+
+        // Restrict permissions on the store file
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&store_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&store_path, perms);
+            }
+        }
+
+        passphrase
+    }
+
+    fn get_store_path() -> std::path::PathBuf {
+        if let Some(proj_dirs) = directories::ProjectDirs::from("com", "r-burp", "r-burp") {
+            proj_dirs.data_local_dir().join("store.json")
+        } else {
+            std::env::temp_dir().join("r-burp-store.json")
         }
     }
 

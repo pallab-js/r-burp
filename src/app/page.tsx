@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { AppLayout } from "../components/layout/app-layout";
 import { Card, Badge } from "../components/ui";
 import type { NavItem, TrafficStats } from "../types";
@@ -48,8 +49,26 @@ export default function Home() {
 
   useEffect(() => {
     refreshDashboard();
-    const interval = setInterval(refreshDashboard, 2000);
-    return () => clearInterval(interval);
+
+    const unsubs: Array<() => void> = [];
+    const setupListeners = async () => {
+      const unsubStats = await listen<TrafficStats>("proxy:stats-updated", (event) => {
+        setStats(event.payload);
+      });
+      unsubs.push(unsubStats);
+
+      const unsubStarted = await listen("proxy-started", () => refreshDashboard());
+      unsubs.push(unsubStarted);
+
+      const unsubStopped = await listen("proxy-stopped", () => {
+        setProxyStatus("Idle");
+        refreshDashboard();
+      });
+      unsubs.push(unsubStopped);
+    };
+    setupListeners();
+
+    return () => { unsubs.forEach((u) => u()); };
   }, [refreshDashboard]);
 
   return (

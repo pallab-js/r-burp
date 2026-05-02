@@ -7,7 +7,6 @@ export interface HttpRequest {
   version: string;
   headers: Record<string, string>;
   body: number[] | null;
-  body_text: string | null;
   timestamp: string;
   host: string;
   content_type: string | null;
@@ -21,7 +20,6 @@ export interface HttpResponse {
   version: string;
   headers: Record<string, string>;
   body: number[] | null;
-  body_text: string | null;
   content_type: string | null;
   content_length: number;
   duration_ms: number;

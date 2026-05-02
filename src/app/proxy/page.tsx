@@ -42,6 +42,9 @@ export default function ProxyPage() {
   });
   const [proxyRunning, setProxyRunning] = useState(false);
   const [statusText, setStatusText] = useState("Idle");
+  const [proxyHost, setProxyHost] = useState("127.0.0.1");
+  const [proxyPort, setProxyPort] = useState(8080);
+  const [portError, setPortError] = useState("");
   const [filterMethod, setFilterMethod] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -91,14 +94,17 @@ export default function ProxyPage() {
         refreshData();
       });
       unsubs.push(unsubCleared);
+
+      // Push-based update: refresh list whenever a new request completes
+      const unsubStats = await listen("proxy:stats-updated", () => {
+        refreshData();
+      });
+      unsubs.push(unsubStats);
     };
 
     setupListeners();
 
-    // Still poll for new transactions (events from Rust backend during proxy)
-    const interval = setInterval(refreshData, 1000);
     return () => {
-      clearInterval(interval);
       unsubs.forEach((unsub) => unsub());
     };
   }, [refreshData]);
@@ -149,8 +155,13 @@ export default function ProxyPage() {
   }, [summaries, selectedId, proxyRunning]);
 
   const handleStartProxy = async () => {
+    if (proxyPort < 1024 || proxyPort > 65535) {
+      setPortError("Port must be between 1024 and 65535");
+      return;
+    }
+    setPortError("");
     try {
-      await startProxy("127.0.0.1", 8080);
+      await startProxy(proxyHost, proxyPort);
       setProxyRunning(true);
       refreshData();
     } catch {
@@ -204,6 +215,28 @@ export default function ProxyPage() {
       <div className="flex flex-col h-screen">
         {/* Toolbar */}
         <div className="flex items-center gap-3 px-4 py-2 border-b border-border-primary bg-surface-400">
+          {!proxyRunning && (
+            <>
+              <input
+                type="text"
+                value={proxyHost}
+                onChange={(e) => setProxyHost(e.target.value)}
+                placeholder="127.0.0.1"
+                className="w-28 px-2 py-1 text-xs font-mono bg-surface-300 border border-border-primary rounded text-cursor-dark/80 focus:outline-none focus:border-border-solid"
+              />
+              <input
+                type="number"
+                value={proxyPort}
+                onChange={(e) => setProxyPort(Number(e.target.value))}
+                min={1024}
+                max={65535}
+                className="w-20 px-2 py-1 text-xs font-mono bg-surface-300 border border-border-primary rounded text-cursor-dark/80 focus:outline-none focus:border-border-solid"
+              />
+              {portError && (
+                <span className="text-xs text-error">{portError}</span>
+              )}
+            </>
+          )}
           <Button
             variant={proxyRunning ? "tertiary-pill" : "primary"}
             onClick={proxyRunning ? handleStopProxy : handleStartProxy}
