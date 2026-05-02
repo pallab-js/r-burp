@@ -68,10 +68,13 @@ jobs:
         platform:
           - os: macos-latest
             name: macOS
+            bundles: app
           - os: ubuntu-latest
             name: Linux
+            bundles: deb
           - os: windows-latest
             name: Windows
+            bundles: msi
 
     runs-on: ${{ matrix.platform.os }}
     steps:
@@ -99,7 +102,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        run: cargo tauri build
+        run: cargo tauri build -- --bundles ${{ matrix.platform.bundles }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
