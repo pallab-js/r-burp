@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use tauri::command;
 
 /// Represents the state of a proxy listener
@@ -43,13 +43,13 @@ pub fn get_current_timestamp() -> String {
 
 #[command]
 pub fn get_listeners(state: tauri::State<AppState>) -> Vec<ListenerConfig> {
-    let listeners = state.listeners.lock().unwrap();
+    let listeners = state.listeners.lock();
     listeners.clone()
 }
 
 #[command]
 pub fn start_listener(listener_id: u32, state: tauri::State<AppState>) -> Result<bool, String> {
-    let mut listeners = state.listeners.lock().unwrap();
+    let mut listeners = state.listeners.lock();
     for listener in listeners.iter_mut() {
         if listener.id == listener_id {
             listener.is_running = true;
@@ -61,7 +61,7 @@ pub fn start_listener(listener_id: u32, state: tauri::State<AppState>) -> Result
 
 #[command]
 pub fn stop_listener(listener_id: u32, state: tauri::State<AppState>) -> Result<bool, String> {
-    let mut listeners = state.listeners.lock().unwrap();
+    let mut listeners = state.listeners.lock();
     for listener in listeners.iter_mut() {
         if listener.id == listener_id {
             listener.is_running = false;
@@ -73,7 +73,7 @@ pub fn stop_listener(listener_id: u32, state: tauri::State<AppState>) -> Result<
 
 #[command]
 pub fn get_request_count(state: tauri::State<AppState>) -> u64 {
-    *state.request_count.lock().unwrap()
+    *state.request_count.lock()
 }
 
 #[command]
@@ -110,7 +110,7 @@ pub fn add_listener(
         ));
     }
 
-    let mut listeners = state.listeners.lock().unwrap();
+    let mut listeners = state.listeners.lock();
     let new_id = listeners.iter().map(|l| l.id).max().unwrap_or(0) + 1;
 
     listeners.push(ListenerConfig {
@@ -136,7 +136,7 @@ fn is_loopback_address(host: &str) -> bool {
 
 #[command]
 pub fn remove_listener(listener_id: u32, state: tauri::State<AppState>) -> Result<bool, String> {
-    let mut listeners = state.listeners.lock().unwrap();
+    let mut listeners = state.listeners.lock();
     let initial_len = listeners.len();
     listeners.retain(|l| l.id != listener_id);
     Ok(listeners.len() < initial_len)
@@ -155,7 +155,7 @@ mod tests {
 
     // Helper: start listener by directly manipulating state
     fn test_start_listener(state: &AppState, listener_id: u32) -> Result<bool, String> {
-        let mut listeners = state.listeners.lock().unwrap();
+        let mut listeners = state.listeners.lock();
         for listener in listeners.iter_mut() {
             if listener.id == listener_id {
                 listener.is_running = true;
@@ -166,7 +166,7 @@ mod tests {
     }
 
     fn test_stop_listener(state: &AppState, listener_id: u32) -> Result<bool, String> {
-        let mut listeners = state.listeners.lock().unwrap();
+        let mut listeners = state.listeners.lock();
         for listener in listeners.iter_mut() {
             if listener.id == listener_id {
                 listener.is_running = false;
@@ -192,7 +192,7 @@ mod tests {
         if trimmed_host.contains(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_') {
             return Err("Host contains invalid characters".to_string());
         }
-        let mut listeners = state.listeners.lock().unwrap();
+        let mut listeners = state.listeners.lock();
         let new_id = listeners.iter().map(|l| l.id).max().unwrap_or(0) + 1;
         listeners.push(ListenerConfig {
             id: new_id,
@@ -205,7 +205,7 @@ mod tests {
     }
 
     fn test_remove_listener(state: &AppState, listener_id: u32) -> Result<bool, String> {
-        let mut listeners = state.listeners.lock().unwrap();
+        let mut listeners = state.listeners.lock();
         let initial_len = listeners.len();
         listeners.retain(|l| l.id != listener_id);
         Ok(listeners.len() < initial_len)
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_get_listeners_returns_initial_listener() {
         let state = create_test_state();
-        let listeners = state.listeners.lock().unwrap();
+        let listeners = state.listeners.lock();
         assert_eq!(listeners.len(), 0);
     }
 
@@ -238,7 +238,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap());
 
-        let listeners = state.listeners.lock().unwrap();
+        let listeners = state.listeners.lock();
         assert!(listeners[0].is_running);
     }
 
@@ -251,7 +251,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap());
 
-        let listeners = state.listeners.lock().unwrap();
+        let listeners = state.listeners.lock();
         assert!(!listeners[0].is_running);
     }
 
@@ -294,7 +294,7 @@ mod tests {
         let new_id = result.unwrap();
         assert!(new_id >= 1);
 
-        let listeners = state.listeners.lock().unwrap();
+        let listeners = state.listeners.lock();
         assert_eq!(listeners.len(), 1);
 
         let new_listener = listeners.iter().find(|l| l.id == new_id).unwrap();
@@ -312,7 +312,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap());
 
-        let listeners = state.listeners.lock().unwrap();
+        let listeners = state.listeners.lock();
         assert_eq!(listeners.len(), 0);
     }
 
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn test_get_request_count_initially_zero() {
         let state = create_test_state();
-        let count = state.request_count.lock().unwrap();
+        let count = state.request_count.lock();
         assert_eq!(*count, 0);
     }
 }
@@ -340,6 +340,7 @@ use crate::proxy::{RequestSummary, TrafficStats, HttpTransaction};
 use crate::server::ProxyServer;
 use crate::AppRuntime;
 use tauri::Emitter;
+use std::sync::Arc;
 
 #[command]
 pub fn get_transactions(state: tauri::State<AppRuntime>) -> Vec<HttpTransaction> {
@@ -368,7 +369,17 @@ pub fn clear_transactions(state: tauri::State<AppRuntime>) {
 }
 
 #[command]
-pub fn start_proxy(host: String, port: u16, state: tauri::State<AppRuntime>) -> Result<String, String> {
+pub fn start_proxy(host: String, port: u16, state: tauri::State<Arc<AppRuntime>>) -> Result<String, String> {
+    let trimmed = host.trim();
+    if !is_loopback_address(trimmed) {
+        return Err(format!(
+            "Binding to '{}' would expose the proxy on the network. Only loopback addresses are allowed.",
+            trimmed
+        ));
+    }
+    if port < 1024 {
+        return Err("Port must be >= 1024".to_string());
+    }
     // Check if already running
     {
         let existing = state.proxy_shutdown.lock();
@@ -377,40 +388,42 @@ pub fn start_proxy(host: String, port: u16, state: tauri::State<AppRuntime>) -> 
         }
     }
 
-    let host_clone = host.clone();
-    let engine_clone = state.engine.clone();
-    let intercept_clone = state.intercept.clone();
-    let certs_clone = state.certs.clone();
+    let host_clone = host.trim().to_string();
     let handle = state.app_handle.lock().clone();
+    let runtime_arc: Arc<AppRuntime> = Arc::clone(&state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     *state.proxy_shutdown.lock() = Some(shutdown_tx);
 
     state.runtime.spawn(async move {
-        let mut srv = ProxyServer::new(engine_clone, intercept_clone, certs_clone, host_clone, port, handle.clone());
-        let srv_shutdown = shutdown_rx;
+        let mut srv = ProxyServer::new(
+            runtime_arc.engine.clone(),
+            runtime_arc.intercept.clone(),
+            runtime_arc.certs.clone(),
+            host_clone,
+            port,
+            handle.clone(),
+            runtime_arc.tls_client_config.clone(),
+        );
 
-        let result = tokio::select! {
-            r = srv.start_with_shutdown(srv_shutdown) => r,
-        };
+        let result = srv.start_with_shutdown(shutdown_rx).await;
+
+        // Always clear the shutdown handle so start_proxy can be called again
+        *runtime_arc.proxy_shutdown.lock() = None;
 
         match result {
             Ok(()) => {
-                if let Some(h) = handle {
-                    let _ = h.emit("proxy-stopped", ());
-                }
+                if let Some(h) = handle { let _ = h.emit("proxy-stopped", ()); }
             }
             Err(e) => {
                 log::error!("Proxy server error: {}", e);
-                if let Some(h) = handle {
-                    let _ = h.emit("proxy-error", e.to_string());
-                }
+                if let Some(h) = handle { let _ = h.emit("proxy-error", e.to_string()); }
             }
         }
     });
 
     state.emit_event("proxy-started", ());
-    Ok(format!("Proxy started on {}:{}", host, port))
+    Ok(format!("Proxy started on {}:{}", host.trim(), port))
 }
 
 #[command]
@@ -465,18 +478,17 @@ pub fn resume_intercept(
     body: Option<Vec<u8>>,
     state: tauri::State<AppRuntime>,
 ) -> Result<bool, String> {
-    let action = InterceptAction::Modify {
-        method,
-        url,
-        headers,
-        body,
-    };
-    Ok(state.intercept.resume_intercept(&request_id, action))
+    let action = InterceptAction::Modify { method, url, headers, body };
+    let result = state.intercept.resume_intercept(&request_id, action);
+    state.emit_event("intercept:pending-updated", ());
+    Ok(result)
 }
 
 #[command]
 pub fn drop_intercept(request_id: String, state: tauri::State<AppRuntime>) -> Result<bool, String> {
-    Ok(state.intercept.resume_intercept(&request_id, InterceptAction::Drop))
+    let result = state.intercept.resume_intercept(&request_id, InterceptAction::Drop);
+    state.emit_event("intercept:pending-updated", ());
+    Ok(result)
 }
 
 #[command]

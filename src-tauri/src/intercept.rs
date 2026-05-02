@@ -82,6 +82,8 @@ pub struct InterceptEngine {
     pub rule_counter: RwLock<u32>,
 }
 
+const MAX_PENDING_INTERCEPTS: usize = 50;
+
 impl Default for InterceptEngine {
     fn default() -> Self {
         Self {
@@ -108,13 +110,27 @@ pub struct InterceptRegistration {
 }
 
 impl InterceptEngine {
-    /// Register a new pending intercept, returns the receiver for the action
+    /// Register a new pending intercept, returns the receiver for the action.
+    /// Auto-forwards the oldest pending entry if the queue is full.
     pub fn register_intercept(
         &self,
         registration: InterceptRegistration,
     ) -> Option<oneshot::Receiver<InterceptAction>> {
         if !*self.enabled.read() {
             return None;
+        }
+
+        // Evict oldest if at capacity to prevent unbounded memory growth
+        {
+            let mut pending = self.pending.write();
+            if pending.len() >= MAX_PENDING_INTERCEPTS {
+                if let Some(oldest_id) = pending.keys().next().cloned() {
+                    if let Some(p) = pending.remove(&oldest_id) {
+                        log::warn!("Intercept queue full, auto-forwarding {}", oldest_id);
+                        let _ = p.sender.send(InterceptAction::Forward);
+                    }
+                }
+            }
         }
 
         let (tx, rx) = oneshot::channel();

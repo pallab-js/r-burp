@@ -64,11 +64,18 @@ export default function InterceptorPage() {
     };
     checkStatus();
     refreshPending();
-    const interval = setInterval(() => {
-      checkStatus();
-      refreshPending();
-    }, 1000);
-    return () => clearInterval(interval);
+
+    let unsub: (() => void) | undefined;
+    const setup = async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unsub = await listen("intercept:pending-updated", () => {
+        checkStatus();
+        refreshPending();
+      });
+    };
+    setup();
+
+    return () => { unsub?.(); };
   }, [refreshPending]);
 
   const handleToggleIntercept = async () => {

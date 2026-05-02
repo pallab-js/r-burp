@@ -8,7 +8,7 @@ import { RequestInspector } from "../../components/proxy/request-inspector";
 import { Button } from "../../components/ui/button";
 import { Badge } from "../../components/ui/badge";
 import {
-  getTransactions,
+  getTransaction,
   getRequestSummaries,
   getTrafficStats,
   startProxy,
@@ -50,9 +50,8 @@ export default function ProxyPage() {
 
   const refreshData = useCallback(async () => {
     try {
-      const [s, txs, st, status] = await Promise.all([
+      const [s, st, status] = await Promise.all([
         getRequestSummaries(),
-        getTransactions(),
         getTrafficStats(),
         getProxyStatus(),
       ]);
@@ -60,9 +59,10 @@ export default function ProxyPage() {
       setStats(st);
       setStatusText(status);
 
+      // Only fetch the full transaction when one is selected
       if (selectedId) {
-        const found = txs.find((t) => t.id === selectedId) ?? null;
-        setSelectedTx(found);
+        const tx = await getTransaction(selectedId);
+        setSelectedTx(tx);
       }
     } catch {
       // Running in browser dev mode — no Tauri backend

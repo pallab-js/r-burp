@@ -232,35 +232,58 @@ impl CertManager {
         format!("{:x}", result)
     }
 
-    /// Encrypt the private key PEM data using XOR with a derived key stream.
+    /// Encrypt the private key PEM using AES-256-GCM.
+    /// Output format: [12-byte nonce][ciphertext+tag]
     fn encrypt_key(key_pem: &str, passphrase: &str) -> Result<Vec<u8>, CertError> {
-        if passphrase.is_empty() {
+        use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+        use rand::RngCore;
+
+        let key_bytes = hex::decode(passphrase)
+            .map_err(|_| CertError::Encrypt("passphrase is not valid hex".to_string()))?;
+        if key_bytes.len() != 32 {
             return Err(CertError::EmptyPassphrase);
         }
-        let key_bytes = key_pem.as_bytes();
-        let pass_bytes = passphrase.as_bytes();
-        let mut encrypted = Vec::with_capacity(key_bytes.len());
-        for (i, &byte) in key_bytes.iter().enumerate() {
-            encrypted.push(byte ^ pass_bytes[i % pass_bytes.len()]);
-        }
-        Ok(encrypted)
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, key_pem.as_bytes())
+            .map_err(|e| CertError::Encrypt(e.to_string()))?;
+
+        let mut out = nonce_bytes.to_vec();
+        out.extend(ciphertext);
+        Ok(out)
     }
 
-    /// Decrypt the private key from the encrypted file format.
+    /// Decrypt the private key from AES-256-GCM format.
     fn decrypt_key(encrypted: &[u8], passphrase: &str) -> Result<String, CertError> {
-        if encrypted.is_empty() {
-            return Err(CertError::Decrypt("encrypted key file is empty".to_string()));
+        use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+
+        if encrypted.len() < 13 {
+            return Err(CertError::Decrypt("encrypted key file too small".to_string()));
         }
         if passphrase.is_empty() {
             return Err(CertError::EmptyPassphrase);
         }
-        let pass_bytes = passphrase.as_bytes();
-        let mut decrypted = Vec::with_capacity(encrypted.len());
-        for (i, &byte) in encrypted.iter().enumerate() {
-            decrypted.push(byte ^ pass_bytes[i % pass_bytes.len()]);
+
+        let key_bytes = hex::decode(passphrase)
+            .map_err(|_| CertError::Decrypt("passphrase is not valid hex".to_string()))?;
+        if key_bytes.len() != 32 {
+            return Err(CertError::Decrypt("passphrase must be 32 bytes (64 hex chars)".to_string()));
         }
-        String::from_utf8(decrypted)
-            .map_err(|_| CertError::Decrypt("invalid passphrase or corrupted data".to_string()))
+
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&encrypted[..12]);
+
+        let plaintext = cipher.decrypt(nonce, &encrypted[12..])
+            .map_err(|_| CertError::Decrypt("decryption failed: wrong passphrase or corrupted data".to_string()))?;
+
+        String::from_utf8(plaintext)
+            .map_err(|_| CertError::Decrypt("decrypted data is not valid UTF-8".to_string()))
     }
 }
 
@@ -271,18 +294,22 @@ mod tests {
     #[test]
     fn test_passphrase_round_trip() {
         let pem = "-----BEGIN PRIVATE KEY-----\nfakekey\n-----END PRIVATE KEY-----\n";
-        let passphrase = "test-passphrase-abc123";
-        let encrypted = CertManager::encrypt_key(pem, passphrase).unwrap();
-        let decrypted = CertManager::decrypt_key(&encrypted, passphrase).unwrap();
+        // AES-256-GCM requires a 32-byte key encoded as 64 hex chars
+        let passphrase = "a".repeat(64);
+        let encrypted = CertManager::encrypt_key(pem, &passphrase).unwrap();
+        let decrypted = CertManager::decrypt_key(&encrypted, &passphrase).unwrap();
         assert_eq!(decrypted, pem);
     }
 
     #[test]
-    fn test_wrong_passphrase_returns_garbage_not_original() {
+    fn test_wrong_passphrase_returns_error() {
         let pem = "hello world";
-        let encrypted = CertManager::encrypt_key(pem, "correct").unwrap();
-        let decrypted = CertManager::decrypt_key(&encrypted, "wrong").unwrap_or_default();
-        assert_ne!(decrypted, pem);
+        let correct = "b".repeat(64);
+        let wrong = "c".repeat(64);
+        let encrypted = CertManager::encrypt_key(pem, &correct).unwrap();
+        // AES-GCM authentication tag will fail with wrong key
+        let result = CertManager::decrypt_key(&encrypted, &wrong);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -45,3 +45,4 @@ temp/
 **/ca-cert.pem
 **/ca-key.pem
 **/ca-key.pem.enc
+**/store.json

@@ -42,11 +42,11 @@ jobs:
 
       - name: Run cargo-audit (dependency CVE scan)
         working-directory: ./src-tauri
-        run: cargo audit || true
+        run: cargo audit
 
       - name: Run npm audit
         working-directory: ./src
-        run: npm audit || true
+        run: npm audit --audit-level=high
 
       - name: Build frontend
         working-directory: ./src

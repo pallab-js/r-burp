@@ -41,11 +41,20 @@ pub struct ProxyServer {
     pub host: String,
     pub port: u16,
     pub app_handle: Option<tauri::AppHandle>,
+    pub tls_client_config: Arc<rustls::ClientConfig>,
 }
 
 impl ProxyServer {
-    pub fn new(engine: Arc<ProxyEngine>, intercept: Arc<InterceptEngine>, certs: Arc<CertManager>, host: String, port: u16, app_handle: Option<tauri::AppHandle>) -> Self {
-        Self { engine, intercept, certs, host, port, app_handle }
+    pub fn new(
+        engine: Arc<ProxyEngine>,
+        intercept: Arc<InterceptEngine>,
+        certs: Arc<CertManager>,
+        host: String,
+        port: u16,
+        app_handle: Option<tauri::AppHandle>,
+        tls_client_config: Arc<rustls::ClientConfig>,
+    ) -> Self {
+        Self { engine, intercept, certs, host, port, app_handle, tls_client_config }
     }
 
     pub async fn start_with_shutdown(
@@ -57,6 +66,7 @@ impl ProxyServer {
         let engine = self.engine.clone();
         let intercept = self.intercept.clone();
         let app_handle = self.app_handle.clone();
+        let tls_cfg = self.tls_client_config.clone();
 
         log::info!("Proxy server listening on {}:{}", self.host, self.port);
 
@@ -68,8 +78,9 @@ impl ProxyServer {
                     let intercept = intercept.clone();
                     let certs = self.certs.clone();
                     let handle = app_handle.clone();
+                    let tls = tls_cfg.clone();
                     tokio::task::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, engine, intercept, certs, handle).await {
+                        if let Err(e) = Self::handle_connection(stream, engine, intercept, certs, handle, tls).await {
                             log::warn!("Connection error: {}", e);
                         }
                     });
@@ -90,15 +101,16 @@ impl ProxyServer {
         intercept: Arc<InterceptEngine>,
         certs: Arc<CertManager>,
         app_handle: Option<tauri::AppHandle>,
+        tls_client_config: Arc<rustls::ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut buf = [0u8; 16];
         let n = stream.peek(&mut buf).await?;
         let peeked = String::from_utf8_lossy(&buf[..n]);
 
         if peeked.starts_with("CONNECT ") {
-            Self::handle_connect(stream, engine, intercept, certs, app_handle).await
+            Self::handle_connect(stream, engine, intercept, certs, app_handle, tls_client_config).await
         } else {
-            Self::handle_http(stream, engine, intercept, app_handle).await
+            Self::handle_http(stream, engine, intercept, app_handle, tls_client_config).await
         }
     }
 
@@ -108,6 +120,7 @@ impl ProxyServer {
         intercept: Arc<InterceptEngine>,
         certs: Arc<CertManager>,
         app_handle: Option<tauri::AppHandle>,
+        tls_client_config: Arc<rustls::ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut buf = Vec::new();
         let mut header_buf = [0u8; 1];
@@ -130,9 +143,11 @@ impl ProxyServer {
         }
 
         let target = parts[1];
-        let target_parts: Vec<&str> = target.split(':').collect();
-        let host = target_parts.first().unwrap_or(&"unknown");
-        let port = target_parts.get(1).unwrap_or(&"443");
+
+        // Parse host:port correctly, handling IPv6 [::1]:443
+        let (host, port) = parse_connect_target(target).ok_or_else(|| {
+            format!("Invalid CONNECT target: {}", target.chars().take(64).collect::<String>())
+        })?;
 
         stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -157,11 +172,11 @@ impl ProxyServer {
         engine.start_transaction(captured_request);
         emit_new_request(&app_handle, engine.get_stats());
 
-        let (cert_pem, key_pem) = if let Some(pair) = certs.generate_domain_cert(host) {
+        let (cert_pem, key_pem) = if let Some(pair) = certs.generate_domain_cert(&host) {
             pair
         } else {
             log::warn!("Cannot generate cert for {}, tunneling without MITM", host);
-            Self::blind_tunnel(stream, host.to_string(), port.to_string(), engine, tunnel_id, app_handle).await?;
+            Self::blind_tunnel(stream, host, port, engine, tunnel_id, app_handle, tls_client_config).await?;
             return Ok(());
         };
 
@@ -181,7 +196,7 @@ impl ProxyServer {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         let tls_stream = acceptor.accept(stream).await?;
 
-        Self::handle_tls_stream(tls_stream, engine, intercept, app_handle).await
+        Self::handle_tls_stream(tls_stream, engine, intercept, app_handle, tls_client_config).await
     }
 
     async fn blind_tunnel(
@@ -191,8 +206,12 @@ impl ProxyServer {
         engine: Arc<ProxyEngine>,
         tunnel_id: String,
         app_handle: Option<tauri::AppHandle>,
+        _tls_client_config: Arc<rustls::ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let target = TcpStream::connect(format!("{}:{}", host, port)).await?;
+        let target = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpStream::connect(format!("{}:{}", host, port))
+        ).await.map_err(|_| "Blind tunnel connect timeout")??;
         let (mut target_r, mut target_w) = tokio::io::split(target);
         let (mut client_r, mut client_w) = tokio::io::split(stream);
 
@@ -225,6 +244,7 @@ impl ProxyServer {
         engine: Arc<ProxyEngine>,
         intercept: Arc<InterceptEngine>,
         app_handle: Option<tauri::AppHandle>,
+        tls_client_config: Arc<rustls::ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -234,7 +254,8 @@ impl ProxyServer {
             let engine = engine.clone();
             let intercept = intercept.clone();
             let handle = app_handle.clone();
-            handle_request(engine, intercept, req, true, handle)
+            let tls = tls_client_config.clone();
+            handle_request(engine, intercept, req, true, handle, tls)
         });
 
         if let Err(e) = http1_server::Builder::new().keep_alive(true).serve_connection(io, svc).await {
@@ -249,13 +270,15 @@ impl ProxyServer {
         engine: Arc<ProxyEngine>,
         intercept: Arc<InterceptEngine>,
         app_handle: Option<tauri::AppHandle>,
+        tls_client_config: Arc<rustls::ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let io = TokioIo::new(stream);
         let svc = service_fn(move |req| {
             let engine = engine.clone();
             let intercept = intercept.clone();
             let handle = app_handle.clone();
-            handle_request(engine, intercept, req, false, handle)
+            let tls = tls_client_config.clone();
+            handle_request(engine, intercept, req, false, handle, tls)
         });
 
         if let Err(e) = http1_server::Builder::new().serve_connection(io, svc).await {
@@ -284,6 +307,7 @@ async fn handle_request(
     req: Request<Incoming>,
     is_tls: bool,
     app_handle: Option<tauri::AppHandle>,
+    tls_client_config: Arc<rustls::ClientConfig>,
 ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
     let start_time = std::time::Instant::now();
     let request_timestamp = SystemTime::now();
@@ -311,7 +335,18 @@ async fn handle_request(
     }
 
     let content_type = detect_content_type(&headers);
-    let body_bytes = req.collect().await?.to_bytes();
+
+    // Enforce body size limit at the read level (not just via Content-Length header)
+    let body_bytes = {
+        use http_body_util::Limited;
+        let limited = Limited::new(req.into_body(), MAX_BODY_BYTES + 1);
+        match limited.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(_) => {
+                return Ok(Response::builder().status(413).body(Full::new(Bytes::from("Request body too large")))?);
+            }
+        }
+    };
 
     let (final_method, final_url, final_headers, final_body) = if intercept.is_enabled() {
         let request_id = Uuid::new_v4().to_string();
@@ -329,6 +364,8 @@ async fn handle_request(
             status: None,
             status_text: None,
         }) {
+            // Notify frontend that a new intercept is pending
+            if let Some(h) = &app_handle { let _ = h.emit("intercept:pending-updated", ()); }
             match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(Ok(action)) => match action {
                     InterceptAction::Drop => {
@@ -404,16 +441,16 @@ async fn handle_request(
     engine.start_transaction(captured_request);
     emit_new_request(&app_handle, engine.get_stats());
 
-    let response_result = forward_request(&host, &final_method, &rule_modified_url, &rule_modified_headers, &rule_modified_body, is_tls).await;
+    let response_result = forward_request(&host, &final_method, &rule_modified_url, &rule_modified_headers, &rule_modified_body, is_tls, &tls_client_config).await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
     let (response_status, response_headers, response_body) = match response_result {
         Ok((status, resp_headers, body)) => (status, resp_headers, body),
         Err(e) => {
-            log::warn!("Failed to forward request: {}", e);
+            log::warn!("Failed to forward request to {}: {}", host, e);
             let mut resp_headers = HashMap::new();
             resp_headers.insert("content-type".to_string(), "text/plain".to_string());
-            (502, resp_headers, Bytes::from(format!("Proxy error: {}", e)))
+            (502, resp_headers, Bytes::from("Bad Gateway"))
         }
     };
 
@@ -481,7 +518,7 @@ async fn handle_request(
         builder = builder.header(name, value);
     }
 
-    Ok(builder.body(Full::new(final_resp_body)).unwrap())
+    Ok(builder.body(Full::new(final_resp_body))?)
 }
 
 async fn forward_request(
@@ -491,6 +528,7 @@ async fn forward_request(
     headers: &HashMap<String, String>,
     body: &[u8],
     is_tls: bool,
+    tls_client_config: &Arc<rustls::ClientConfig>,
 ) -> Result<(u16, HashMap<String, String>, Bytes), Box<dyn std::error::Error + Send + Sync>> {
     let target_url = if uri.starts_with("http://") || uri.starts_with("https://") {
         uri.to_string()
@@ -526,22 +564,17 @@ async fn forward_request(
     let outbound_req = req_builder.body(Full::new(Bytes::from(body.to_vec())))?;
 
     if scheme == "https" {
-        let mut root_store = rustls::RootCertStore::empty();
-        let native_certs = rustls_native_certs::load_native_certs();
-        for cert in native_certs.certs {
-            let _ = root_store.add(cert);
-        }
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
+            .with_tls_config(tls_client_config.as_ref().clone())
             .https_or_http()
             .enable_http1()
             .build();
         let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
-        let response = client.request(outbound_req).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.request(outbound_req)
+        ).await.map_err(|_| "Upstream request timeout")??;
         let status = response.status().as_u16();
         let mut resp_headers: HashMap<String, String> = HashMap::new();
         for (name, value) in response.headers() {
@@ -555,7 +588,10 @@ async fn forward_request(
     } else {
         let client: hyper_util::client::legacy::Client<HttpConnector, Full<Bytes>> =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
-        let response = client.request(outbound_req).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.request(outbound_req)
+        ).await.map_err(|_| "Upstream request timeout")??;
         let status = response.status().as_u16();
         let mut resp_headers: HashMap<String, String> = HashMap::new();
         for (name, value) in response.headers() {
@@ -567,6 +603,37 @@ async fn forward_request(
         }
         Ok((status, resp_headers, resp_body))
     }
+}
+
+/// Parse a CONNECT authority (host:port or [ipv6]:port) into (host, port).
+/// Validates that host contains no control characters (prevents log injection).
+fn parse_connect_target(target: &str) -> Option<(String, String)> {
+    let (host, port) = if target.starts_with('[') {
+        // IPv6: [::1]:443
+        let bracket_end = target.find(']')?;
+        let host = target[1..bracket_end].to_string();
+        let port = target.get(bracket_end + 2..)?.to_string();
+        (host, port)
+    } else {
+        // hostname:port or IPv4
+        let colon = target.rfind(':')?;
+        (target[..colon].to_string(), target[colon + 1..].to_string())
+    };
+
+    // Validate: no control chars, newlines, or null bytes (log injection prevention)
+    if host.chars().any(|c| c.is_control()) || port.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    // Port must be numeric and in valid range
+    let port_num: u16 = port.parse().ok()?;
+    if port_num == 0 {
+        return None;
+    }
+    // Host must not be empty
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port_num.to_string()))
 }
 
 fn status_text(status: u16) -> String {

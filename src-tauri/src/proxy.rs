@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
 
 /// Represents an HTTP request captured by the proxy
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,137 +68,108 @@ pub struct TrafficStats {
     pub avg_response_time_ms: Option<u64>,
 }
 
+struct EngineInner {
+    transactions: VecDeque<HttpTransaction>,
+    tx_index: HashMap<String, usize>,
+    base_offset: usize,
+    stats: TrafficStats,
+}
+
 /// The core proxy engine that manages HTTP traffic
 pub struct ProxyEngine {
-    pub transactions: RwLock<VecDeque<HttpTransaction>>,
-    /// Maps transaction id → index in the deque (absolute, subtract base_offset to get deque index)
-    tx_index: RwLock<HashMap<String, usize>>,
-    /// Number of transactions ever popped from the front
-    base_offset: RwLock<usize>,
+    inner: parking_lot::Mutex<EngineInner>,
     pub max_transactions: usize,
-    pub stats: RwLock<TrafficStats>,
 }
 
 impl ProxyEngine {
     pub fn new(max_transactions: usize) -> Self {
         Self {
-            transactions: RwLock::new(VecDeque::new()),
-            tx_index: RwLock::new(HashMap::new()),
-            base_offset: RwLock::new(0),
-            max_transactions,
-            stats: RwLock::new(TrafficStats {
-                total_requests: 0,
-                completed_requests: 0,
-                intercepted_requests: 0,
-                total_bytes: 0,
-                avg_response_time_ms: None,
+            inner: parking_lot::Mutex::new(EngineInner {
+                transactions: VecDeque::new(),
+                tx_index: HashMap::new(),
+                base_offset: 0,
+                stats: TrafficStats {
+                    total_requests: 0,
+                    completed_requests: 0,
+                    intercepted_requests: 0,
+                    total_bytes: 0,
+                    avg_response_time_ms: None,
+                },
             }),
+            max_transactions,
         }
     }
 
-    /// Create a new transaction for an incoming request
     pub fn start_transaction(&self, request: HttpRequest) -> String {
         let id = request.id.clone();
-        let transaction = HttpTransaction {
-            id: id.clone(),
-            request,
-            response: None,
-            is_complete: false,
-            is_intercepted: false,
-            is_modified: false,
-        };
-
-        let mut transactions = self.transactions.write();
-        let mut index = self.tx_index.write();
-        let mut base = self.base_offset.write();
-
-        // Evict oldest if at capacity
-        if transactions.len() >= self.max_transactions {
-            if let Some(evicted) = transactions.pop_front() {
-                index.remove(&evicted.id);
-                *base += 1;
+        let mut g = self.inner.lock();
+        if g.transactions.len() >= self.max_transactions {
+            if let Some(evicted) = g.transactions.pop_front() {
+                g.tx_index.remove(&evicted.id);
+                g.base_offset += 1;
             }
         }
-
-        let abs_idx = *base + transactions.len();
-        transactions.push_back(transaction);
-        index.insert(id.clone(), abs_idx);
-
-        let mut stats = self.stats.write();
-        stats.total_requests = transactions.len();
-
+        let abs_idx = g.base_offset + g.transactions.len();
+        g.transactions.push_back(HttpTransaction {
+            id: id.clone(), request, response: None,
+            is_complete: false, is_intercepted: false, is_modified: false,
+        });
+        g.tx_index.insert(id.clone(), abs_idx);
+        g.stats.total_requests = g.transactions.len();
         id
     }
 
-    /// Complete a transaction with a response
     pub fn complete_transaction(&self, request_id: &str, response: HttpResponse) {
-        let mut transactions = self.transactions.write();
-        let index = self.tx_index.read();
-        let base = self.base_offset.read();
-
-        if let Some(&abs_idx) = index.get(request_id) {
-            let deque_idx = abs_idx.saturating_sub(*base);
-            if let Some(txn) = transactions.get_mut(deque_idx) {
+        let mut g = self.inner.lock();
+        if let Some(&abs_idx) = g.tx_index.get(request_id) {
+            let deque_idx = abs_idx.saturating_sub(g.base_offset);
+            if let Some(txn) = g.transactions.get_mut(deque_idx) {
                 txn.response = Some(response.clone());
                 txn.is_complete = true;
             }
         }
-
-        let mut stats = self.stats.write();
-        stats.completed_requests += 1;
-        stats.total_bytes += response.content_length;
+        g.stats.completed_requests += 1;
+        g.stats.total_bytes += response.content_length;
     }
 
-    /// Get all transactions
     pub fn get_transactions(&self) -> Vec<HttpTransaction> {
-        self.transactions.read().iter().cloned().collect()
+        self.inner.lock().transactions.iter().cloned().collect()
     }
 
-    /// Get a single transaction by ID — O(1)
     pub fn get_transaction(&self, id: &str) -> Option<HttpTransaction> {
-        let transactions = self.transactions.read();
-        let index = self.tx_index.read();
-        let base = self.base_offset.read();
-        let &abs_idx = index.get(id)?;
-        let deque_idx = abs_idx.saturating_sub(*base);
-        transactions.get(deque_idx).cloned()
+        let g = self.inner.lock();
+        let &abs_idx = g.tx_index.get(id)?;
+        let deque_idx = abs_idx.saturating_sub(g.base_offset);
+        g.transactions.get(deque_idx).cloned()
     }
 
-    /// Get request summaries for the list view
     pub fn get_summaries(&self) -> Vec<RequestSummary> {
-        self.transactions
-            .read()
-            .iter()
-            .map(|t| RequestSummary {
-                id: t.id.clone(),
-                method: t.request.method.clone(),
-                url: t.request.url.clone(),
-                status: t.response.as_ref().map(|r| r.status),
-                content_type: t.response.as_ref().and_then(|r| r.content_type.clone()),
-                content_length: t.response.as_ref().map_or(0, |r| r.content_length),
-                duration_ms: t.response.as_ref().map(|r| r.duration_ms),
-                timestamp: t.request.timestamp,
-                is_intercepted: t.is_intercepted,
-            })
-            .collect()
+        self.inner.lock().transactions.iter().map(|t| RequestSummary {
+            id: t.id.clone(),
+            method: t.request.method.clone(),
+            url: t.request.url.clone(),
+            status: t.response.as_ref().map(|r| r.status),
+            content_type: t.response.as_ref().and_then(|r| r.content_type.clone()),
+            content_length: t.response.as_ref().map_or(0, |r| r.content_length),
+            duration_ms: t.response.as_ref().map(|r| r.duration_ms),
+            timestamp: t.request.timestamp,
+            is_intercepted: t.is_intercepted,
+        }).collect()
     }
 
-    /// Get current stats
     pub fn get_stats(&self) -> TrafficStats {
-        self.stats.read().clone()
+        self.inner.lock().stats.clone()
     }
 
-    /// Clear all transactions
     pub fn clear_transactions(&self) {
-        self.transactions.write().clear();
-        self.tx_index.write().clear();
-        *self.base_offset.write() = 0;
-        let mut stats = self.stats.write();
-        stats.total_requests = 0;
-        stats.completed_requests = 0;
-        stats.intercepted_requests = 0;
-        stats.total_bytes = 0;
-        stats.avg_response_time_ms = None;
+        let mut g = self.inner.lock();
+        g.transactions.clear();
+        g.tx_index.clear();
+        g.base_offset = 0;
+        g.stats = TrafficStats {
+            total_requests: 0, completed_requests: 0, intercepted_requests: 0,
+            total_bytes: 0, avg_response_time_ms: None,
+        };
     }
 }
 

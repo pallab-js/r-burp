@@ -12,7 +12,6 @@ use certs::CertManager;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tauri::Emitter;
-
 /// Global runtime for running async proxy server
 pub struct AppRuntime {
     pub runtime: Runtime,
@@ -21,6 +20,8 @@ pub struct AppRuntime {
     pub certs: Arc<CertManager>,
     pub app_handle: parking_lot::Mutex<Option<tauri::AppHandle>>,
     pub proxy_shutdown: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Pre-built TLS client config using native system root certs
+    pub tls_client_config: Arc<rustls::ClientConfig>,
 }
 
 impl Default for AppRuntime {
@@ -52,7 +53,19 @@ impl AppRuntime {
             certs: Arc::new(certs),
             app_handle: parking_lot::Mutex::new(None),
             proxy_shutdown: parking_lot::Mutex::new(None),
+            tls_client_config: Arc::new(Self::build_tls_client_config()),
         }
+    }
+
+    fn build_tls_client_config() -> rustls::ClientConfig {
+        let mut root_store = rustls::RootCertStore::empty();
+        let native_certs = rustls_native_certs::load_native_certs();
+        for cert in native_certs.certs {
+            let _ = root_store.add(cert);
+        }
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
     }
 
     /// Load the CA key passphrase from the store file, or generate and persist a new one.
@@ -128,13 +141,15 @@ pub fn run() {
         .manage(AppState::default())
         .manage(app_runtime.clone())
         .setup(move |app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(if cfg!(debug_assertions) {
+                        log::LevelFilter::Info
+                    } else {
+                        log::LevelFilter::Warn
+                    })
+                    .build(),
+            )?;
 
             // Store app handle for event emission
             *app_runtime.app_handle.lock() = Some(app.handle().clone());
