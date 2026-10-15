@@ -135,6 +135,13 @@ impl AppRuntime {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Multiple rustls crypto providers (ring and aws-lc-rs) can be pulled in transitively
+    // by our TLS dependencies, which makes automatic provider selection ambiguous and
+    // panics on the first ClientConfig/ServerConfig build. Explicitly install the ring
+    // provider process-wide before any rustls builder runs. Ignore the error if another
+    // provider was already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let app_runtime = Arc::new(AppRuntime::new());
 
     tauri::Builder::default()
