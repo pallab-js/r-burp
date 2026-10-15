@@ -205,19 +205,34 @@ impl CertManager {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        // Re-parse the CA key to get a fresh owned KeyPair for signing
-        let ca_key_for_sign = KeyPair::from_pem(&ca.key_pem).ok()?;
-        let ca_cert_obj = ca_params.self_signed(&ca_key_for_sign).ok()?;
 
-        // Create domain cert
+        // Use the cached CA KeyPair to avoid re-parsing the PEM on every cache miss.
+        // KeyPair is not Clone and signed_by needs a &KeyPair, so we hold the read
+        // guard for the duration of signing. Fall back to parsing the PEM only if
+        // the cached object is somehow absent (e.g. the key PEM failed to parse at load).
+        let ca_key_guard = self.ca_key_obj.read();
+        let fallback_key;
+        let ca_key_for_sign: &KeyPair = match ca_key_guard.as_ref() {
+            Some(k) => k,
+            None => {
+                fallback_key = KeyPair::from_pem(&ca.key_pem).ok()?;
+                &fallback_key
+            }
+        };
+        let ca_cert_obj = ca_params.self_signed(ca_key_for_sign).ok()?;
+
+        // Create domain cert. CertificateParams::new seeds subject_alt_names with the
+        // domain as a DnsName, but we set it explicitly to guarantee a SAN is present —
+        // modern browsers ignore CN and require SAN for hostname validation.
         let mut params = CertificateParams::new(vec![domain.to_string()]).ok()?;
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(domain.to_string().try_into().ok()?)];
         let mut dn = DistinguishedName::new();
         dn.push(rcgen::DnType::CommonName, domain);
         dn.push(rcgen::DnType::OrganizationName, "r-burp");
         params.distinguished_name = dn;
 
         let domain_key = KeyPair::generate().ok()?;
-        let cert = params.signed_by(&domain_key, &ca_cert_obj, &ca_key_for_sign).ok()?;
+        let cert = params.signed_by(&domain_key, &ca_cert_obj, ca_key_for_sign).ok()?;
 
         let result = (cert.pem(), domain_key.serialize_pem());
         self.domain_cert_cache.lock().put(domain.to_string(), result.clone());
@@ -336,6 +351,33 @@ mod tests {
         let (cert_pem, key_pem) = mgr.generate_domain_cert("example.com").unwrap();
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(key_pem.contains("BEGIN PRIVATE KEY") || key_pem.contains("BEGIN EC PRIVATE KEY"));
+    }
+
+    #[test]
+    fn test_domain_cert_has_san() {
+        let mgr = CertManager::with_passphrase("test-pass".to_string());
+        mgr.generate_ca().unwrap();
+        let (cert_pem, _) = mgr.generate_domain_cert("secure.example.com").unwrap();
+
+        // Decode PEM to DER and look for the subjectAltName extension OID (2.5.29.17),
+        // which encodes to the DER bytes `06 03 55 1D 11`, followed by the domain
+        // appearing as an IA5String within the SAN sequence. Browsers require SAN
+        // (not CN) for hostname validation, so this must be present.
+        let der = pem::parse(cert_pem.as_bytes()).expect("valid PEM");
+        let der_bytes = der.contents();
+
+        const SAN_OID: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x11];
+        assert!(
+            der_bytes.windows(SAN_OID.len()).any(|w| w == SAN_OID),
+            "generated cert is missing the subjectAltName extension OID"
+        );
+
+        // The domain name must appear in the DER (as the DnsName SAN value).
+        let domain_bytes = b"secure.example.com";
+        assert!(
+            der_bytes.windows(domain_bytes.len()).any(|w| w == domain_bytes),
+            "generated cert SAN does not contain the domain name"
+        );
     }
 
     #[test]

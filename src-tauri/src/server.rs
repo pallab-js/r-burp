@@ -422,6 +422,12 @@ async fn handle_request(
         }
     }
 
+    // Recompute Content-Length after any body modification (intercept Modify or rule
+    // ReplaceBody). Forwarding a stale Content-Length causes clients/upstreams to hang
+    // or truncate. Only set it when the request semantically carries a body: GET/HEAD
+    // without an original Content-Length should not gain one.
+    normalize_content_length(&mut rule_modified_headers, rule_modified_body.len());
+
     let captured_request = HttpRequest {
         id: Uuid::new_v4().to_string(),
         method: final_method.clone(),
@@ -496,6 +502,14 @@ async fn handle_request(
         (response_status, response_headers.clone(), response_body.clone())
     };
 
+    // The body may have been modified by a response intercept, and the upstream may
+    // have used chunked transfer-encoding (no valid Content-Length). Strip hop-by-hop
+    // headers and set Content-Length to match the actual buffered body before relaying
+    // to the client; otherwise the client may hang, truncate, or reject the response.
+    let mut final_resp_headers = final_resp_headers;
+    strip_hop_by_hop_headers(&mut final_resp_headers);
+    normalize_content_length(&mut final_resp_headers, final_resp_body.len());
+
     let resp_ct = final_resp_headers.get("content-type").map(|s| s.split(';').next().unwrap_or(s).to_string());
 
     let captured_response = HttpResponse {
@@ -556,7 +570,10 @@ async fn forward_request(
 
     for (name, value) in headers {
         let name_lower = name.to_lowercase();
-        if name_lower != "host" && name_lower != "connection" {
+        // Skip Host (set explicitly above) and all hop-by-hop headers per RFC 7230 §6.1.
+        // Forwarding transfer-encoding alongside a fully-buffered Full<Bytes> body with a
+        // computed Content-Length is a correctness and request-smuggling risk.
+        if name_lower != "host" && !is_hop_by_hop_header(&name_lower) {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
     }
@@ -652,5 +669,125 @@ fn status_text(status: u16) -> String {
         502 => "Bad Gateway".to_string(),
         503 => "Service Unavailable".to_string(),
         _ => format!("Status {}", status),
+    }
+}
+
+/// Hop-by-hop headers that MUST NOT be forwarded by a proxy (RFC 7230 §6.1).
+/// Compared against a lowercased header name.
+fn is_hop_by_hop_header(name_lower: &str) -> bool {
+    matches!(
+        name_lower,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Remove all hop-by-hop headers from a header map (case-insensitive).
+fn strip_hop_by_hop_headers(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !is_hop_by_hop_header(&name.to_lowercase()));
+}
+
+/// Set `content-length` to match the actual body length after a body modification.
+///
+/// - If `body_len > 0`, always set/overwrite `content-length` to the correct value.
+/// - If `body_len == 0`, only overwrite an existing `content-length` (set it to "0");
+///   do not add one to a request that never carried a body (e.g. a plain GET), which
+///   would be semantically incorrect.
+///
+/// Any existing `content-length` entry is removed first so case variants
+/// (`Content-Length` vs `content-length`) cannot produce a duplicate, conflicting header.
+fn normalize_content_length(headers: &mut HashMap<String, String>, body_len: usize) {
+    let had_content_length = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-length"));
+    headers.retain(|k, _| !k.eq_ignore_ascii_case("content-length"));
+
+    if body_len > 0 || had_content_length {
+        headers.insert("content-length".to_string(), body_len.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_is_hop_by_hop_header() {
+        for h in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(is_hop_by_hop_header(h), "{} should be hop-by-hop", h);
+        }
+        assert!(!is_hop_by_hop_header("content-type"));
+        assert!(!is_hop_by_hop_header("authorization"));
+        assert!(!is_hop_by_hop_header("host"));
+    }
+
+    #[test]
+    fn test_strip_hop_by_hop_headers_case_insensitive() {
+        let mut headers = HashMap::new();
+        headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        headers.insert("Connection".to_string(), "keep-alive".to_string());
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("X-Custom".to_string(), "keep-me".to_string());
+
+        strip_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("transfer-encoding")));
+        assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("connection")));
+        assert_eq!(headers.get("Content-Type").map(String::as_str), Some("application/json"));
+        assert_eq!(headers.get("X-Custom").map(String::as_str), Some("keep-me"));
+    }
+
+    #[test]
+    fn test_normalize_content_length_updates_existing() {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Length".to_string(), "100".to_string());
+        normalize_content_length(&mut headers, 42);
+        // Stale value replaced with the real body length (single canonical entry).
+        assert_eq!(headers.get("content-length").map(String::as_str), Some("42"));
+        assert_eq!(
+            headers.keys().filter(|k| k.eq_ignore_ascii_case("content-length")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_normalize_content_length_adds_for_nonempty_body() {
+        let mut headers = HashMap::new();
+        normalize_content_length(&mut headers, 10);
+        assert_eq!(headers.get("content-length").map(String::as_str), Some("10"));
+    }
+
+    #[test]
+    fn test_normalize_content_length_no_add_for_empty_body_without_existing() {
+        let mut headers = HashMap::new();
+        normalize_content_length(&mut headers, 0);
+        // A GET with no body should not gain a Content-Length header.
+        assert!(!headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn test_normalize_content_length_zeroes_existing_on_empty_body() {
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), "500".to_string());
+        normalize_content_length(&mut headers, 0);
+        assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
     }
 }
