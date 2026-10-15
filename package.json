@@ -2,7 +2,7 @@
   "name": "r-burp",
   "version": "0.1.0",
   "private": true,
-  "description": "A lightweight, secure, privacy-oriented desktop proxy toolkit",
+  "description": "A lightweight, privacy-oriented desktop HTTP/HTTPS proxy for inspecting and modifying web traffic",
   "license": "MIT",
   "scripts": {
     "dev": "cd src && npm run dev",
